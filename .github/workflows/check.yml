@@ -1,0 +1,138 @@
+name: Dump specific firmwares
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  update:
+    runs-on: ubuntu-20.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: "SM-T865"
+            region: "DBT"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+
+      - name: Compare latest version with current version
+        id: check
+        run: |
+          need_update=0
+          latest=`curl --retry 5 --retry-delay 5 http://fota-cloud-dn.ospserver.net/firmware/${{ matrix.region }}/${{ matrix.model }}/version.xml | grep latest | sed 's/^[^>]*>//' | sed 's/<.*//'`
+          latest_short=`echo $latest | cut -d'/' -f1`
+          current=`cat ${{ matrix.model }}_${{ matrix.region }}/current` || need_update=1
+          [[ $latest != $current ]] && need_update=1
+          echo ::set-output name=latest_version::$latest
+          echo ::set-output name=latest_shortversion::$latest_short
+          echo ::set-output name=need_update::$need_update
+
+      - name: Print available space
+        if: steps.check.outputs.need_update == 1
+        run: |
+          sudo df -h
+
+      - name: Install dependencies
+        if: steps.check.outputs.need_update == 1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblz4-tool zip simg2img
+          sudo wget -O /usr/bin/samfirm https://github.com/jesec/SamFirm.NET/releases/latest/download/linux-x64 && sudo chmod +x /usr/bin/samfirm
+          sudo wget -O /usr/bin/omc-decoder.jar http://corsica.nu/omc-decoder.jar && sudo chmod +x /usr/bin/omc-decoder.jar
+
+      - name: Print available space
+        if: steps.check.outputs.need_update == 1
+        run: |
+          sudo df -h
+
+      - name: Fetch firmware
+        if: steps.check.outputs.need_update == 1
+        run: samfirm -m ${{ matrix.model }} -r ${{ matrix.region }}
+
+      - name: Print available space
+        if: steps.check.outputs.need_update == 1
+        run: |
+          sudo df -h
+
+      - name: Print directory structure
+        if: steps.check.outputs.need_update == 1
+        run: ls -la ${{ matrix.model }}_${{ matrix.region }}
+
+      - name: Print available space
+        if: steps.check.outputs.need_update == 1
+        run: |
+          sudo df -h
+          
+      - name: Extract images from AP and create zip
+        if: steps.check.outputs.need_update == 1
+        id: releases
+        run: |
+          cd ${{ matrix.model }}_${{ matrix.region }}
+          rm -rf HOME_CSC*tar.md5
+          parts=(super system vendor product prism optics boot)
+          for partition in ${parts[@]}; do for tar in `ls | grep tar.md5`; do [[ `tar tvf $tar | grep $partition` ]] && tar xvf $tar $(echo `tar tvf $tar | grep $partition | awk -F " " '{print $NF}'`); lz4 -dm $(echo `tar tvf $tar | grep $partition | awk -F " " '{print $NF}'`); rm -rf $(echo `tar tvf $tar | grep $partition | awk -F " " '{print $NF}'`); done; done
+          rm -rf *.tar*
+          for partition in ${parts[@]}; do for i in `find -type f -name "$partition*"`; do if [[ "$i" != "./$partition.img" ]]; then mv $i $partition.img; fi; done; done
+          for i in *img; do if [[ "$i" != "boot.img" ]]; then simg2img $i $i-new; rm -rf $i; mv $i-new $i; fi; done
+          if [[ -f super.img ]]; then is_super=1; lpunpack super.img; rm -rf super.img; fi
+          mv system.img system_root.img
+           mkdir -p rom
+          for image in *.img; do if [[ "$image" != "boot.img" ]]; then folder="${image%.*}"
+            sudo mkdir -p $folder; sudo mount -o loop,rw,sync $image $folder;
+            if [[ "$folder" == "system" ]]; then if [ ! -e "$folder/system/lib64/libhades.so" ];then sudo mv $folder/system/lib64/libPSI.so $folder/system/lib64/libhades.so; sudo ln -s /system/lib64/libhades.so $folder/system/lib64/libPSI.so; fi; fi
+            if [ "$(mount | grep $folder)" ];then sudo find $folder -type l -ls | awk '{print "symlink(\""$13"\", \"/"$11"\");"}' | sort > symlinks_$folder.txt;fi
+            cap=(cap_chown=0 cap_dac_override=1 cap_dac_read_search=2 cap_fowner=3 cap_fsetid=4 cap_kill=5 cap_setgid=6 cap_setuid=7 cap_setpcap=8 cap_linux_immutable=9 cap_net_bind_service=10 cap_net_broadcast=11 cap_net_admin=12 cap_net_raw=13 cap_ipc_lock=14 cap_ipc_owner=15 cap_sys_module=16 cap_sys_rawio=17 cap_sys_chroot=18 cap_sys_ptrace=19 cap_sys_pacct=20 cap_sys_admin=21 cap_sys_boot=22 cap_sys_nice=23 cap_sys_resource=24 cap_sys_time=25 cap_sys_tty_config=26 cap_mknod=27 cap_lease=28 cap_audit_write=29 cap_audit_control=30 cap_setfcap=31 cap_mac_override=32 cap_mac_admin=33 cap_syslog=34 cap_wake_alarm=35 cap_block_suspend=36 cap_audit_read=37);
+            if [ "$(mount | grep $folder)" ];then for i in `sudo find $folder -not -type l`;do echo -n $(stat -c '%n %u %g %#a %C' "$i");if [ -d "$i" ];then echo -n " dir ";else echo -n " file ";fi;a=0;for j in $(getcap $i | awk '{print $3}' | tr "," "\n" | sed 's/\+ep//g');do a=$((a+$((2**`printf '%s\n' ${cap[@]} | grep -P "$j" | awk -F "=" '{print $2}'`))));done;printf  0x"%x\n" $a; done | sort | awk '{if($6=="dir"){print "set_metadata_recursive(\"/"$1"\", \"uid\", "$2", \"gid\", "$3", \"dmode\", "$4", \"fmode\", 0644, \"capabilities\", "$7", \"selabel\", \""$5"\");"}else{print "set_metadata(\"/"$1"\", \"uid\", "$2", \"gid\", "$3", \"mode\", "$4", \"capabilities\", "$7", \"selabel\", \""$5"\");"}}' > metadata_$folder.txt; fi
+            if [ "$(mount | grep $folder)" ];then for i in `sudo find $folder -not -type l`;do if [ -d "$i" ]; then mkdir -p rom/$i;else sudo cp -r $i rom/$i;fi; done;fi
+            if [ "$(mount | grep $folder)" ];then sudo umount $folder && rm -rf $folder && rm -rf $image;fi;fi
+          done
+          mv rom/* .
+          rm -rf rom
+          for empty in `find . -type d`; do if [ ! "$(ls -A $empty)" ];then echo "" > $empty/placeholder; fi; done
+          if [[ $is_super == 1 ]]; then omc=optics; else omc=product; fi
+          java -jar /usr/bin/omc-decoder.jar -i $omc -o $omc
+          find -type f -size +99M -print | zip ../{{ steps.check.outputs.latest_shortversion }}_large-files.zip -@
+          find -type f -size +99M -exec rm -r -v {} +
+          cd ..
+          sudo chmod -R 755 *
+          tag=$(date +'%Y%m%d%H%M%S')
+          echo ::set-output name=tag::$tag
+
+      - name: Update current version
+        if: steps.check.outputs.need_update == 1
+        run: |
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 157286400
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git pull origin ${{github.ref}} --ff-only
+          echo ${{ steps.check.outputs.latest_version }} > ${{ matrix.model }}_${{ matrix.region }}/current
+          git add .
+          git commit -m "${{ matrix.model }}/${{ matrix.region }}: ${{ steps.check.outputs.latest_version }}"
+          git tag ${{ steps.releases.outputs.tag }}
+
+      - name: Push changes to repo
+        if: steps.check.outputs.need_update == 1
+        uses: ad-m/github-push-action@master
+        with:
+          tags: true
+          github_token: ${{ secrets.TOKEN }}
+
+      - name: Upload release assets
+        if: steps.check.outputs.need_update == 1
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+        with:
+          body_path: ${{ matrix.model }}_/current
+          tag_name: ${{ steps.releases.outputs.tag }}
+          name: "$${{ matrix.model }} / ${{ matrix.region }} - {{ steps.check.outputs.latest_shortversion }}"
+          files: |
+            {{ steps.check.outputs.latest_shortversion }}_large-files.zip
+
